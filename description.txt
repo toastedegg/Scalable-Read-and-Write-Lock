@@ -1,0 +1,52 @@
+﻿Writer Queue Structure: MCS queue
+
+
+We use a MCS queue structure for the writers to guarantee that FIFO property. Different from the original version, we add a while loop at the end of the lock() function to check if the global variable I equals zero (indicate that there’s no reader in the tree). If the tree is empty, the writer will set the readFlag (a global variable which prevents readers from entering critical section) to false.
+Consider the situation that a reader enters the tree and set the I to 1 after the writer enter the while loop, but before the writer flip the readFlag, The writer will know nothing about this reader and both threads would enter the critical section. To prevent this situation, the writer will recheck if the variable I is still 0 with a nested loop. If it does, it means that there’s no reader in the critical section after the readFlag is set to false, thus the writer can enter the critical section. If the variable I equals 1, it means some readers may have entered the tree (the fairness is guaranteed by the timestamp), to prevent deadlock, the writer will flip the readFlag to true and let the reader finish its job and redo the while loop (spin on I). The will not result in the starvation of writer because reader will larger timestamp cannot enter the tree.
+In the unlock() function, the writer just set the readFlag to true to let all the readers in the tree proceed. The next writer in the queue will try to reset the readFlag to false and block the readers that arrive after it. The fairness is guaranteed by the timeStamp.
+
+
+
+
+Reader Tree Structure: SNZI non-zero indicator
+
+
+In our first design, we used a modified combined tree which puts all the reader threads at the leaf nodes. But this design would let some reader threads keep waiting for other combined thread finishing their jobs (e.g. root counter+1) before entering the critical section. So we decide to implement a SNZI non-zero indicator, it’s scalable and all the reader threads don’t have to spin on a while loop waiting for others’ work.
+To implement the the atomic CAS for two variables (counter and version) in SNZI, we use a 32bit-unsigned-int. The lower 16 bits are used for the counter, the highest one bit represents ½ status, and the middle 15 bits are for the version number. We use some left shift and right shift operations to make version number reusable after overflow. The variable I and the special counter for the root node are implemented with the same technic.
+In the rwlock constructor we initialize a static binary tree structure for the SNZI. Let’s say we have at most n threads,  the height of the tree is h and leafNum would be 2^h. In our design we guarantee that leafNum<=n<leafnum*2, thus there would be at most 2 threads on each leaf. We use a global variable I to indicate that the tree is empty or not. This variable can only be modified by reader threads calling the root’s arrive() function. We also use another global variable readFlag to tell the readers is they are allowed to enter the critical section.
+Before entering the tree, the reader threads will check the timestamp, then it will call the arrive() function at the leaf node. There’s an important happens-before relation that the reader will add the counter at the root node (set variable I to 1 if necessary) before return from the arrive() function. Then it will spin on a while loop and test if the readFlag is finally set to true and enter the critical section.
+
+
+Communication between the tree and the queue:
+
+
+The communication is based on two global variables: I and readFlag. Variable I indicates if the tree is empty, and readFlag prevents readers from entering the critical section.
+The writer is responsible for setting the readFlag and the reader threads (already reached the root node) is responsible for fliping the I.
+Some details are mentioned in the queue and tree structure.
+
+
+Timestamp with bounded memory:
+
+
+To enforce fairness in the lock acquire process, we add two global counters that are modifiable by write lock only. Each write lock waiting in the queue will update the first global counter cs_time  by one, then it updates the second global counter curr_time after it finishes waiting and successfully grab the lock. In that sense, cs_time represents the timestamp of latest entered writer and curr_time represents the timestamp for the head of the MCS queue. Each thread entering reader lock will read the value of the first global counter and only allowed to enter the SNZI tree when its own timestamp are equal or less to the timestamp of the queue’s head, which is stored in curr_time and maintained by the MCS queue. A late reader must wait for the writer with the same timestamp to become the head of queue before it can enter the tree, therefore ensure relatively fairness. 
+However, the timestamp would grow unbounded related to the number of thread if there are writers keep coming in and grab the lock. Let’s assume we have n threads which could either be readers or writers, the maximum length between head and the tail of the MCS queue is bounded by n in worst case. Therefore, (curr_time + n) must be larger than cs_time if cs_time haven’t been overflowed. In our implementation, reader can only entering the SNZI tree when:
+(1.reader’s timestamp is less or equal to the curr_time counter.
+AND  2.   reader’s (timestamp+n)(this result must not be overflowed) is larger than the curr_time counter.) 
+OR (3. the timestamp of reader is larger than both the cs_time counter and curr_time_counter AND 4. Cs_time counter is larger than curr_time)        
+
+
+Condition 1&2 is to ensure when cs_time and reader’s timestamp both overflowed except curr_time, condition 2 will fail and reader will be trapped. 
+Condition 3&4 is to ensure the correctness that when cs_time curr_time both overflowed, but reader’s timestamp somehow didn't overflow, then the reader can exit the while loop and enter the SNZI tree.
+
+
+With those condition enforced, we can handle the timestamp with bounded memory with one limitation:  the variable stored curr_time and cs_time must have a maximum value larger than (threadnum * 2) without overflow. In our implementation we use uint16_t which have a maximum value of 65535, so the upper limit of thread number is approximately 30000 . We can increasingly this number easily by allocating more bit for the variable. 
+
+
+Interface:
+
+
+rwlock(int n): constructor for the reader-writer lock for at most n threads
+reader_lock(int threadID): call before reader thread enter the critical section
+reader_unlock(int threadID): call after the reader thread exit the critical section
+writer_lock(int threadID): call before writer thread enter the critical section
+writer_unlock(int threadID): call before writer thread enter the critical section
